@@ -1,24 +1,29 @@
 // src/components/auth/CallbackHandler.tsx
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { useAuthActions } from '@/lib/store/authStore';
+import { useAuthStore } from '@/lib/store/authStore';
 import { ROUTES, getErrorMessage } from '@/lib/utils';
 
 export function CallbackHandler() {
 	const router = useRouter();
 	const searchParams = useSearchParams();
-	const { handleAuthCallback } = useAuthActions();
+	const handleAuthCallback = useAuthStore((state) => state.handleAuthCallback);
 
 	const [status, setStatus] = useState<'loading' | 'success' | 'error'>('loading');
 	const [error, setError] = useState<string | null>(null);
+	const processedRef = useRef(false);
 
 	useEffect(() => {
+		// Prevent double processing in React StrictMode
+		if (processedRef.current) return;
+
 		const processCallback = async () => {
+			processedRef.current = true;
+
 			try {
 				console.log('🔥 Processing callback...');
-				console.log('Search params:', searchParams.toString());
 
 				// Get auth_code from URL parameters
 				const authCode = searchParams.get('auth_code');
@@ -38,10 +43,10 @@ export function CallbackHandler() {
 
 				// Redirect to dashboard after a short delay
 				setTimeout(() => {
-					const redirectTo = searchParams.get('redirect') || '/dashboard';
+					const redirectTo = sessionStorage.getItem('auth_redirect') || '/dashboard';
 					console.log('Redirecting to:', redirectTo);
 					router.push(redirectTo);
-				}, 2000);
+				}, 1500);
 
 			} catch (err) {
 				console.error('❌ Callback processing failed:', err);
@@ -57,7 +62,7 @@ export function CallbackHandler() {
 		};
 
 		processCallback();
-	}, [searchParams, handleAuthCallback, router]);
+	}, [searchParams]); // Remove handleAuthCallback and router from deps to prevent re-runs
 
 	if (status === 'loading') {
 		return (

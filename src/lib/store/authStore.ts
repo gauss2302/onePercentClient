@@ -2,7 +2,9 @@
 import { create } from 'zustand';
 import { apiClient } from '@/lib/api/client';
 import { User, AuthState } from '@/types';
-import {UserSchema, validateData} from "@/lib/validaitons";
+import { UserSchema, validateData } from "@/lib/validaitons";
+import {cookies} from "next/headers";
+import { NextResponse } from 'next/server';
 
 interface AuthActions {
 	// Actions
@@ -18,17 +20,22 @@ interface AuthActions {
 	setError: (error: string | null) => void;
 	setUser: (user: User | null) => void;
 	setAuthenticated: (authenticated: boolean) => void;
+	setInitialized: (initialized: boolean) => void;
 }
 
-type AuthStore = AuthState & AuthActions;
+type AuthStore = AuthState & {
+	isInitialized: boolean;
+	initializationPromise: Promise<void> | null;
+} & AuthActions;
 
-// УБИРАЕМ persist - все данные только в памяти
 export const useAuthStore = create<AuthStore>()((set, get) => ({
-	// Initial state - все в памяти, НЕТ localStorage
+	// Initial state
 	user: null,
-	tokens: null, // Не используется
+	tokens: null, // Not used in frontend
 	isAuthenticated: false,
 	isLoading: false,
+	isInitialized: false,
+	initializationPromise: null,
 	error: null,
 
 	// Actions
@@ -38,8 +45,13 @@ export const useAuthStore = create<AuthStore>()((set, get) => ({
 
 			const authUrl = await apiClient.getGoogleAuthUrl();
 
-			// Redirect to Google OAuth
+			// Store the current URL to redirect back after auth
 			if (typeof window !== 'undefined') {
+				const currentPath = window.location.pathname;
+				if (currentPath !== '/auth/login' && currentPath !== '/') {
+					sessionStorage.setItem('auth_redirect', currentPath);
+				}
+
 				window.location.href = authUrl;
 			}
 		} catch (error) {
@@ -53,10 +65,14 @@ export const useAuthStore = create<AuthStore>()((set, get) => ({
 		try {
 			set({ isLoading: true, error: null });
 
+			console.log('🔄 Exchanging auth code for session...');
+
 			const result = await apiClient.exchangeAuthCode(authCode);
 
 			// Validate the response
 			const validatedUser = validateData(UserSchema, result.user);
+
+			console.log('✅ Authentication successful');
 
 			set({
 				user: validatedUser,
@@ -64,7 +80,15 @@ export const useAuthStore = create<AuthStore>()((set, get) => ({
 				isLoading: false,
 				error: null,
 			});
+
+			// Check for stored redirect path
+			const redirectPath = sessionStorage.getItem('auth_redirect');
+			if (redirectPath) {
+				sessionStorage.removeItem('auth_redirect');
+				window.location.href = redirectPath;
+			}
 		} catch (error) {
+			console.error('❌ Authentication callback failed:', error);
 			const errorMessage = error instanceof Error ? error.message : 'Authentication callback failed';
 			set({
 				error: errorMessage,
@@ -81,11 +105,12 @@ export const useAuthStore = create<AuthStore>()((set, get) => ({
 			set({ isLoading: true });
 
 			await apiClient.logout();
+
+			console.log('✅ Logout successful');
 		} catch (error) {
-			console.error('Logout error:', error);
-			// Continue with logout even if API call fails
+			console.error('⚠️ Logout API error (continuing with local cleanup):', error);
 		} finally {
-			// Clear all state
+			// Always clear local state
 			set({
 				user: null,
 				tokens: null,
@@ -94,49 +119,79 @@ export const useAuthStore = create<AuthStore>()((set, get) => ({
 				error: null,
 			});
 
-			// Redirect to login page
+			// Redirect to home page
 			if (typeof window !== 'undefined') {
-				window.location.href = '/auth/login';
+				window.location.href = '/';
 			}
 		}
 	},
 
-	// Initialize auth on app start - check for existing session
+	// Initialize auth on app start - with singleton promise
 	initializeAuth: async () => {
-		try {
-			set({ isLoading: true });
+		const state = get();
 
-			console.log('🚀 Initializing authentication...');
+		// If already initialized, return immediately
+		if (state.isInitialized) {
+			console.log('⏭️ Auth already initialized');
+			return;
+		}
 
-			const session = await apiClient.checkSession();
+		// If initialization is in progress, wait for it
+		if (state.initializationPromise) {
+			console.log('⏳ Auth initialization already in progress, waiting...');
+			return state.initializationPromise;
+		}
 
-			if (session) {
-				console.log('✅ Valid session found');
-				const validatedUser = validateData(UserSchema, session.user);
-				set({
-					user: validatedUser,
-					isAuthenticated: true,
-					isLoading: false,
-					error: null,
-				});
-			} else {
-				console.log('❌ No valid session found');
+		// Create a new initialization promise
+		const initPromise = (async () => {
+			try {
+				set({ isLoading: true });
+
+				console.log('🚀 Starting auth initialization...');
+
+				// Check if we have a valid session (HttpOnly cookies)
+				const session = await apiClient.checkSession();
+
+				if (session && session.user) {
+					console.log('✅ Valid session found');
+					const validatedUser = validateData(UserSchema, session.user);
+
+					set({
+						user: validatedUser,
+						isAuthenticated: true,
+						isLoading: false,
+						isInitialized: true,
+						initializationPromise: null,
+						error: null,
+					});
+				} else {
+					console.log('ℹ️ No active session');
+					set({
+						user: null,
+						isAuthenticated: false,
+						isLoading: false,
+						isInitialized: true,
+						initializationPromise: null,
+						error: null,
+					});
+				}
+			} catch (error) {
+				console.error('⚠️ Auth initialization error:', error);
 				set({
 					user: null,
 					isAuthenticated: false,
 					isLoading: false,
+					isInitialized: true,
+					initializationPromise: null,
 					error: null,
 				});
 			}
-		} catch (error) {
-			console.error('Auth initialization failed:', error);
-			set({
-				user: null,
-				isAuthenticated: false,
-				isLoading: false,
-				error: null,
-			});
-		}
+		})();
+
+		// Store the promise to prevent concurrent initialization
+		set({ initializationPromise: initPromise });
+
+		return initPromise;
 	},
 
 	updateProfile: async (data: { name: string; picture?: string }) => {
@@ -163,7 +218,21 @@ export const useAuthStore = create<AuthStore>()((set, get) => ({
 	setError: (error: string | null) => set({ error }),
 	setUser: (user: User | null) => set({ user, isAuthenticated: !!user }),
 	setAuthenticated: (authenticated: boolean) => set({ isAuthenticated: authenticated }),
+	setInitialized: (initialized: boolean) => set({ isInitialized: initialized }),
 }));
+
+// Set up global auth event listener
+if (typeof window !== 'undefined') {
+	window.addEventListener('auth:logout', () => {
+		console.log('🚪 Received auth:logout event');
+		const store = useAuthStore.getState();
+
+		// Only logout if not already logging out
+		if (!store.isLoading) {
+			store.logout();
+		}
+	});
+}
 
 // Utility hooks
 export const useAuth = () => {
@@ -172,6 +241,7 @@ export const useAuth = () => {
 		user: store.user,
 		isAuthenticated: store.isAuthenticated,
 		isLoading: store.isLoading,
+		isInitialized: store.isInitialized,
 		error: store.error,
 	};
 };

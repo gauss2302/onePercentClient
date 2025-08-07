@@ -3,19 +3,25 @@
 
 import { useAuth } from '@/lib/store/authStore';
 import { useRouter } from 'next/navigation';
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 
 export default function DashboardPage() {
-	const { user, isAuthenticated, isLoading } = useAuth();
+	const { user, isAuthenticated, isLoading, isInitialized } = useAuth();
 	const router = useRouter();
+	const redirectedRef = useRef(false);
 
 	useEffect(() => {
-		if (!isLoading && !isAuthenticated) {
-			router.push('/login');
-		}
-	}, [isAuthenticated, isLoading, router]);
+		// Only redirect once, after initialization is complete
+		if (!isInitialized || isLoading) return;
 
-	if (isLoading) {
+		if (!isAuthenticated && !redirectedRef.current) {
+			redirectedRef.current = true;
+			router.push('/auth/login');
+		}
+	}, [isAuthenticated, isInitialized, isLoading, router]);
+
+	// Show loading while auth is initializing
+	if (!isInitialized || isLoading) {
 		return (
 			<div className="min-h-screen flex items-center justify-center">
 				<div className="animate-spin h-8 w-8 border-2 border-blue-600 border-t-transparent rounded-full"></div>
@@ -23,6 +29,7 @@ export default function DashboardPage() {
 		);
 	}
 
+	// Don't render anything while redirecting
 	if (!isAuthenticated || !user) {
 		return null;
 	}

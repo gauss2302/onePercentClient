@@ -1,23 +1,27 @@
 // src/lib/api/client.ts
 import axios, { AxiosInstance, AxiosResponse, AxiosError, InternalAxiosRequestConfig } from 'axios';
-import {ApiError, GoogleAuthResponse, TokenPair, User} from '@/types';
+import { ApiError, User } from '@/types';
 
-// Extend AxiosRequestConfig to include _retry property
 interface ExtendedAxiosRequestConfig extends InternalAxiosRequestConfig {
 	_retry?: boolean;
+	_isRefreshCall?: boolean;
 }
 
 class ApiClient {
 	private client: AxiosInstance;
 	private csrfToken: string | null = null;
-	private accessToken: string | null = null; // Хранится только в памяти
-	private refreshPromise: Promise<string> | null = null; // Для предотвращения одновременных refresh
+	private refreshPromise: Promise<void> | null = null;
+	private isRefreshing = false;
+	private failedQueue: Array<{
+		resolve: (value?: any) => void;
+		reject: (error: any) => void;
+	}> = [];
 
 	constructor() {
 		this.client = axios.create({
 			baseURL: process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8080',
-			timeout: 10000,
-			withCredentials: true, // Важно! Для работы с HttpOnly cookies
+			timeout: 15000,
+			withCredentials: true, // Critical for HttpOnly cookies
 			headers: {
 				'Content-Type': 'application/json',
 			},
@@ -26,20 +30,42 @@ class ApiClient {
 		this.setupInterceptors();
 	}
 
+	private processQueue(error: Error | null = null) {
+		this.failedQueue.forEach(prom => {
+			if (error) {
+				prom.reject(error);
+			} else {
+				prom.resolve();
+			}
+		});
+
+		this.failedQueue = [];
+	}
+
 	private setupInterceptors() {
 		// Request interceptor
 		this.client.interceptors.request.use(
-			(config) => {
+			async (config) => {
+				const extendedConfig = config as ExtendedAxiosRequestConfig;
+
+				// CRITICAL: Don't add CSRF or retry logic to refresh calls
+				if (extendedConfig._isRefreshCall) {
+					return config;
+				}
+
 				// Add CSRF token to unsafe methods
 				if (['post', 'put', 'delete', 'patch'].includes(config.method?.toLowerCase() || '')) {
+					if (!this.csrfToken) {
+						try {
+							await this.ensureCSRFToken();
+						} catch (error) {
+							console.error('Failed to get CSRF token:', error);
+						}
+					}
+
 					if (this.csrfToken) {
 						config.headers['X-CSRF-Token'] = this.csrfToken;
 					}
-				}
-
-				// Add access token from memory
-				if (this.accessToken) {
-					config.headers.Authorization = `Bearer ${this.accessToken}`;
 				}
 
 				return config;
@@ -53,34 +79,68 @@ class ApiClient {
 			async (error: AxiosError) => {
 				const originalRequest = error.config as ExtendedAxiosRequestConfig;
 
-				// Handle 401 errors (access token expired)
-				if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
+				// CRITICAL: Never retry refresh calls to prevent infinite loops
+				if (originalRequest?._isRefreshCall) {
+					return Promise.reject(error);
+				}
+
+				// Handle CSRF token errors (403)
+				if (error.response?.status === 403 && originalRequest && !originalRequest._retry) {
 					originalRequest._retry = true;
 
+					// Clear and refetch CSRF token
+					this.csrfToken = null;
+
 					try {
-						// Prevent multiple simultaneous refresh attempts
-						if (this.refreshPromise) {
-							const newAccessToken = await this.refreshPromise;
-							this.accessToken = newAccessToken;
-						} else {
-							this.refreshPromise = this.refreshAccessToken();
-							const newAccessToken = await this.refreshPromise;
-							this.accessToken = newAccessToken;
-							this.refreshPromise = null;
+						await this.ensureCSRFToken();
+
+						if (originalRequest.headers && this.csrfToken) {
+							originalRequest.headers['X-CSRF-Token'] = this.csrfToken;
 						}
 
-						// Retry original request with new token
-						if (originalRequest.headers && this.accessToken) {
-							originalRequest.headers.Authorization = `Bearer ${this.accessToken}`;
-						}
 						return this.client(originalRequest);
-					} catch (refreshError) {
-						// Refresh failed, redirect to login
-						this.clearAuth();
-						if (typeof window !== 'undefined') {
-							window.location.href = '/auth/login';
-						}
+					} catch (csrfError) {
+						return Promise.reject(error);
 					}
+				}
+
+				// Handle 401 errors (authentication required)
+				if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
+					// Skip auth endpoints to prevent loops
+					const isAuthEndpoint = originalRequest.url?.includes('/auth/');
+					if (isAuthEndpoint) {
+						return Promise.reject(error);
+					}
+
+					if (this.isRefreshing) {
+						// If already refreshing, queue this request
+						return new Promise((resolve, reject) => {
+							this.failedQueue.push({ resolve, reject });
+						}).then(() => {
+							return this.client(originalRequest);
+						}).catch(err => {
+							return Promise.reject(err);
+						});
+					}
+
+					originalRequest._retry = true;
+					this.isRefreshing = true;
+
+					return new Promise((resolve, reject) => {
+						this.refreshAccessToken()
+							.then(() => {
+								this.processQueue();
+								resolve(this.client(originalRequest));
+							})
+							.catch((err) => {
+								this.processQueue(err);
+								this.handleAuthFailure();
+								reject(err);
+							})
+							.finally(() => {
+								this.isRefreshing = false;
+							});
+					});
 				}
 
 				return Promise.reject(this.handleError(error));
@@ -107,34 +167,53 @@ class ApiClient {
 		};
 	}
 
-	// Token management (access token only in memory)
-	setAccessToken(token: string): void {
-		this.accessToken = token;
+	private handleAuthFailure(): void {
+		// Clear local state
+		this.clearAuth();
+
+		// Dispatch event for auth store to handle
+		if (typeof window !== 'undefined') {
+			window.dispatchEvent(new CustomEvent('auth:logout'));
+
+			// Only redirect if not already on login page
+			if (!window.location.pathname.includes('/auth/login')) {
+				window.location.href = '/auth/login';
+			}
+		}
 	}
 
 	clearAuth(): void {
-		this.accessToken = null;
 		this.csrfToken = null;
 		this.refreshPromise = null;
-	}
-
-	isAuthenticated(): boolean {
-		return !!this.accessToken;
+		this.isRefreshing = false;
+		this.failedQueue = [];
 	}
 
 	// CSRF token management
-	async getCSRFToken(): Promise<string> {
+	private async ensureCSRFToken(): Promise<string> {
+		if (this.csrfToken) {
+			return this.csrfToken;
+		}
+
 		try {
-			const response = await this.client.get('/api/v1/csrf-token');
+			const response = await this.client.get('/api/v1/csrf-token', {
+				_isRefreshCall: true // Prevent interceptor loops
+			} as ExtendedAxiosRequestConfig);
+
 			this.csrfToken = response.data.csrf_token;
 			return this.csrfToken!;
 		} catch (error) {
+			console.error('Failed to get CSRF token:', error);
 			throw this.handleError(error as AxiosError);
 		}
 	}
 
+	async getCSRFToken(): Promise<string> {
+		return this.ensureCSRFToken();
+	}
+
 	// Auth methods
-	async getGoogleAuthUrl(): Promise<GoogleAuthResponse> {
+	async getGoogleAuthUrl(): Promise<string> {
 		try {
 			const response = await this.client.get('/api/v1/auth/web/google');
 			return response.data.auth_url;
@@ -143,11 +222,9 @@ class ApiClient {
 		}
 	}
 
-	async exchangeAuthCode(authCode: string): Promise<{ user: User; accessToken: string }> {
+	async exchangeAuthCode(authCode: string): Promise<{ user: User; tokens: { access_token: string } }> {
 		try {
-			if (!this.csrfToken) {
-				await this.getCSRFToken();
-			}
+			await this.ensureCSRFToken();
 
 			const response = await this.client.post('/api/v1/auth/web/exchange-code', {
 				auth_code: authCode
@@ -155,44 +232,71 @@ class ApiClient {
 
 			const { user, tokens } = response.data;
 
-			// Храним только access token в памяти
-			// Refresh token автоматически сохранится как HttpOnly cookie на бэкенде
-			this.accessToken = tokens.access_token;
-
-			return { user, accessToken: tokens.access_token };
+			return { user, tokens };
 		} catch (error) {
 			throw this.handleError(error as AxiosError);
 		}
 	}
 
 	// Refresh tokens using HttpOnly cookie
-	private async refreshAccessToken(): Promise<string> {
-		try {
-			if (!this.csrfToken) {
-				await this.getCSRFToken();
-			}
-
-			// Отправляем запрос БЕЗ refresh_token в теле - он в HttpOnly cookie
-			const response = await this.client.post('/api/v1/auth/refresh', {});
-
-			return response.data.tokens.access_token;
-		} catch (error) {
-			throw this.handleError(error as AxiosError);
+	private async refreshAccessToken(): Promise<void> {
+		// Prevent multiple simultaneous refresh attempts
+		if (this.refreshPromise) {
+			return this.refreshPromise;
 		}
+
+		this.refreshPromise = (async () => {
+			try {
+				// Ensure we have CSRF token before refresh
+				if (!this.csrfToken) {
+					try {
+						const csrfResponse = await this.client.get('/api/v1/csrf-token', {
+							_isRefreshCall: true
+						} as ExtendedAxiosRequestConfig);
+						this.csrfToken = csrfResponse.data.csrf_token;
+					} catch (csrfError) {
+						console.error('Failed to get CSRF token for refresh:', csrfError);
+					}
+				}
+
+				// CRITICAL: Mark this as a refresh call to prevent interceptor loops
+				const config: ExtendedAxiosRequestConfig = {
+					_isRefreshCall: true,
+					headers: {}
+				} as ExtendedAxiosRequestConfig;
+
+				// Add CSRF token if available
+				if (this.csrfToken && config.headers) {
+					config.headers['X-CSRF-Token'] = this.csrfToken;
+				}
+
+				const response = await this.client.post('/api/v1/auth/refresh', {}, config);
+
+				// Backend returns new access token and sets new cookies
+				console.log('✅ Token refreshed successfully');
+			} catch (error) {
+				console.error('❌ Token refresh failed:', error);
+				throw error;
+			} finally {
+				this.refreshPromise = null;
+			}
+		})();
+
+		return this.refreshPromise;
 	}
 
 	async logout(): Promise<void> {
 		try {
-			if (!this.csrfToken) {
-				await this.getCSRFToken();
-			}
+			await this.ensureCSRFToken();
 
-			// Отправляем запрос БЕЗ refresh_token в теле - он в HttpOnly cookie
-			await this.client.post('/api/v1/auth/logout', {});
+			// Mark as refresh call to prevent interceptor interference
+			await this.client.post('/api/v1/auth/logout', {}, {
+				_isRefreshCall: true
+			} as ExtendedAxiosRequestConfig);
 
 			this.clearAuth();
 		} catch (error) {
-			// Очищаем локальное состояние даже если запрос не удался
+			// Clear local state even if request fails
 			this.clearAuth();
 			throw this.handleError(error as AxiosError);
 		}
@@ -210,9 +314,7 @@ class ApiClient {
 
 	async updateProfile(data: { name: string; picture?: string }): Promise<User> {
 		try {
-			if (!this.csrfToken) {
-				await this.getCSRFToken();
-			}
+			await this.ensureCSRFToken();
 
 			const response = await this.client.put('/api/v1/profile', data);
 			return response.data.user;
@@ -221,24 +323,27 @@ class ApiClient {
 		}
 	}
 
-	// Check if we have valid session (access token or can refresh)
-	async checkSession(): Promise<{ user: User; accessToken: string } | null> {
+	// Check if we have valid session
+	async checkSession(): Promise<{ user: User } | null> {
 		try {
-			// Если есть access token, проверяем его
-			if (this.accessToken) {
-				const user = await this.getProfile();
-				return { user, accessToken: this.accessToken };
-			}
-
-			// Если нет access token, пытаемся обновить через HttpOnly cookie
-			const newAccessToken = await this.refreshAccessToken();
-			this.accessToken = newAccessToken;
-
+			// This will trigger token refresh if needed via interceptors
 			const user = await this.getProfile();
-			return { user, accessToken: newAccessToken };
+			return { user };
 		} catch (error) {
-			// Нет валидной сессии
+			// No valid session - return null instead of throwing
 			return null;
+		}
+	}
+
+	// Health check
+	async healthCheck(): Promise<boolean> {
+		try {
+			const response = await this.client.get('/api/v1/health', {
+				_isRefreshCall: true // Prevent auth checks on health endpoint
+			} as ExtendedAxiosRequestConfig);
+			return response.status === 200;
+		} catch {
+			return false;
 		}
 	}
 }

@@ -1,63 +1,52 @@
-import React, {useEffect, useState} from "react";
-import {useRouter, usePathname} from "next/navigation";
-import {useAuthActions, useAuth} from "@/lib/store/authStore";
+import React, { useEffect, useState } from "react";
+import { useRouter, usePathname } from "next/navigation";
+import { useAuthStore } from "@/lib/store/authStore";
+import { ROUTES } from "@/lib/utils";
 
 interface ProtectedRouteProps {
-	children: React.ReactNode;
-	fallback?: React.ReactNode;
-	redirectTo?: string;
+  children: React.ReactNode;
+  fallback?: React.ReactNode;
+  redirectTo?: string;
 }
 
 export function ProtectedRoute({
-	children,
-	fallback,
-	redirectTo = "/auth/login",
-							   }: ProtectedRouteProps) {
+  children,
+  fallback,
+  redirectTo = ROUTES.LOGIN || "/auth/login",
+}: ProtectedRouteProps) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const { user } = useAuthStore();
+  const [isMounted, setIsMounted] = useState(false);
 
-	const router = useRouter();
-	const pathname = usePathname();
-	const {isInitialized, isAuthenticated, isLoading} = useAuth();
-	const {checkAuth} = useAuthActions();
-	const [isChecking, setIsChecking] = useState(true);
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
 
-	useEffect(()=>{
-		const verifyAuth = async () => {
-			if(!isInitialized) {
-				return;
-			}
+  useEffect(() => {
+    if (isMounted && !user) {
+      sessionStorage.setItem("auth_redirect", pathname);
+      router.push(`${redirectTo}?redirect=${encodeURIComponent(pathname)}`);
+    }
+  }, [user, isMounted, pathname, router, redirectTo]);
 
-			if(!isAuthenticated) {
-				setIsChecking(true);
-				const isValid = await checkAuth();
+  // Show fallback or nothing while mounting or checking auth
+  if (!isMounted || !user) {
+    return (
+      <>
+        {fallback || (
+          <div className="min-h-screen flex items-center justify-center">
+            <div className="text-center">
+              <div className="animate-spin h-8 w-8 border-2 border-primary border-t-transparent rounded-full mx-auto mb-4"></div>
+              <p className="text-sm text-muted-foreground">
+                Verifying authentication...
+              </p>
+            </div>
+          </div>
+        )}
+      </>
+    );
+  }
 
-				if(!isValid) {
-					sessionStorage.setItem("auth_redirect", pathname);
-					router.push(`${redirectTo}?redirect=${encodeURIComponent(pathname)}`);
-				}
-				setIsChecking(false);
-			} else {
-				setIsChecking(false);
-			}
-		};
-
-		verifyAuth();
-	}, [isAuthenticated, isInitialized, pathname, router, redirectTo, checkAuth]);
-
-	if(!isInitialized || isLoading || isChecking) {
-		return fallback || (
-			<div className={"min-h-screen items-center justify-between"}>
-				<div className={"text-center"}>
-					<div
-						className="animate-spin h-8 w-8 border-2 border-primary border-t-transparent rounded-full mx-auto mb-4"></div>
-					<p className="text-sm text-muted-foreground">Verifying authentication...</p>
-				</div>
-			</div>
-		);
-	}
-
-	if (!isAuthenticated) {
-		return null;
-	}
-
-	return <>{children}</>;
+  return <>{children}</>;
 }

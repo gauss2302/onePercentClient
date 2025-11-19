@@ -179,20 +179,34 @@ export function debounce<T extends (...args: any[]) => any>(
 	};
 }
 
-// Constants
+// Исправленные константы маршрутов
 export const ROUTES = {
 	HOME: '/',
-	LOGIN: '/login',
-	CALLBACK: '/callback',
+	LOGIN: '/auth/login', // Исправлено
+	CALLBACK: '/auth/callback', // Исправлено
+	DASHBOARD: '/dashboard',
 	PROFILE: '/profile',
+	SETTINGS: '/settings',
+	SKILLS: '/skills',
 } as const;
 
 export const API_ENDPOINTS = {
+	// Health & CSRF
 	HEALTH: '/api/v1/health',
 	CSRF_TOKEN: '/api/v1/csrf-token',
+
+	// Auth endpoints
 	GOOGLE_AUTH: '/api/v1/auth/web/google',
 	EXCHANGE_CODE: '/api/v1/auth/web/exchange-code',
 	REFRESH: '/api/v1/auth/refresh',
 	LOGOUT: '/api/v1/auth/logout',
+
+	// User endpoints
 	PROFILE: '/api/v1/profile',
+
+	// Skills endpoints (для будущего использования)
+	SKILLS: '/api/v1/skills',
+	SKILLS_BY_CATEGORY: (category: string) => `/api/v1/skills/category/${category}`,
+	SKILL_BY_ID: (id: string) => `/api/v1/skills/${id}`,
+	SKILLS_METADATA: '/api/v1/skills/metadata',
 } as const;
